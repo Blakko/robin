@@ -8,13 +8,17 @@ import {
 import {
   computeRetryDelayMs,
   delayMs,
+  errorMessage,
   getLlmCompletionAttemptCount,
+  isInvalidReasoningEffortError,
   isOpenRouterRouterModel,
   isRetriableLlmError,
+  isUnsupportedReasoningEffortError,
   openRouterStallError,
   resolveLlmTimeoutMs,
   shouldUseJsonResponseMode,
 } from "./llm-retry";
+import { ReasoningFallbackReason } from "./reasoning-fallback";
 import * as core from "@actions/core";
 
 export interface ChatCompletionResult {
@@ -24,6 +28,10 @@ export interface ChatCompletionResult {
 
 export type LlmProgressHandler = (detail: string) => void | Promise<void>;
 
+type OpenRouterReasoningRequest = {
+  reasoning?: { effort: string; exclude: boolean };
+};
+
 export class LLMClient {
   private client: OpenAI;
   private model: string;
@@ -32,6 +40,9 @@ export class LLMClient {
   private routerModel: boolean;
   private temperature: number;
   private onProgress?: LlmProgressHandler;
+  private reasoningEffort?: string;
+  private reasoningFallbackActive = false;
+  private reasoningFallbackReason?: ReasoningFallbackReason;
 
   constructor(
     baseUrl: string,
@@ -41,12 +52,14 @@ export class LLMClient {
     timeoutMs = DEFAULT_LLM_TIMEOUT_MS,
     maxAttempts = DEFAULT_LLM_COMPLETION_ATTEMPTS,
     temperature = DEFAULT_LLM_TEMPERATURE,
-    onProgress?: LlmProgressHandler
+    onProgress?: LlmProgressHandler,
+    reasoningEffort?: string
   ) {
     this.model = model;
     this.temperature = temperature;
     this.routerModel = isOpenRouterRouterModel(model);
     this.onProgress = onProgress;
+    this.reasoningEffort = reasoningEffort?.trim() || undefined;
     this.maxOutputTokens =
       maxOutputTokens && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0
         ? maxOutputTokens
@@ -77,6 +90,10 @@ export class LLMClient {
     return { model: this.model };
   }
 
+  getReasoningFallbackReason(): ReasoningFallbackReason | undefined {
+    return this.reasoningFallbackReason;
+  }
+
   private async progress(detail: string): Promise<void> {
     if (!this.onProgress) return;
     try {
@@ -102,10 +119,11 @@ export class LLMClient {
         await this.progress(
           `Waiting for provider (attempt ${attempt}/${this.maxAttempts})…`
         );
-        const request = this.buildRequest(systemPrompt, userContent, useJson);
-        const { content, model: resolvedModel } = this.routerModel
-          ? await this.streamChatCompletion(request)
-          : await this.blockingChatCompletion(request);
+        const { content, model: resolvedModel } = await this.performRequest(
+          systemPrompt,
+          userContent,
+          useJson
+        );
 
         if (content) {
           if (!this.routerModel) {
@@ -151,6 +169,53 @@ export class LLMClient {
     );
   }
 
+  /**
+   * One completion request. If the provider rejects the reasoning parameter as
+   * unsupported or rejects its configured value, warn and retry once without it;
+   * the fallback then stays off so normal retry attempts are not multiplied.
+   */
+  private async performRequest(
+    systemPrompt: string,
+    userContent: string,
+    jsonResponseMode: boolean
+  ): Promise<ChatCompletionResult> {
+    try {
+      return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
+    } catch (error) {
+      if (this.reasoningFallbackActive || !this.reasoningEffort) {
+        throw error;
+      }
+
+      const fallbackReason = isUnsupportedReasoningEffortError(error, this.reasoningEffort)
+        ? "unsupported"
+        : isInvalidReasoningEffortError(error, this.reasoningEffort)
+          ? "invalid-value"
+          : undefined;
+      if (!fallbackReason) throw error;
+
+      this.reasoningFallbackActive = true;
+      this.reasoningFallbackReason = fallbackReason;
+      core.warning(
+        `Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${errorMessage(error)}). ` +
+          "Retrying once without the reasoning parameter and continuing this run without reasoning controls."
+      );
+      await this.progress(
+        fallbackReason === "invalid-value"
+          ? "Provider rejected the configured reasoning effort — retrying without it…"
+          : "Provider rejected reasoning controls — retrying without them…"
+      );
+      return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
+    }
+  }
+
+  private async dispatch(
+    request: OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest
+  ): Promise<ChatCompletionResult> {
+    return this.routerModel
+      ? await this.streamChatCompletion(request)
+      : await this.blockingChatCompletion(request);
+  }
+
   private async blockingChatCompletion(
     request: OpenAI.Chat.Completions.ChatCompletionCreateParams
   ): Promise<ChatCompletionResult> {
@@ -166,7 +231,7 @@ export class LLMClient {
 
   /** Stream so the first SSE chunk (model id) proves OpenRouter routed; abort if none arrives. */
   private async streamChatCompletion(
-    request: OpenAI.Chat.Completions.ChatCompletionCreateParams
+    request: OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest
   ): Promise<ChatCompletionResult> {
     const firstChunkMs = DEFAULT_LLM_ROUTER_FIRST_CHUNK_MS;
     const controller = new AbortController();
@@ -219,6 +284,22 @@ export class LLMClient {
     } catch (error) {
       clearStallTimer();
       if (!gotFirstChunk) {
+        // A 400/422 mentioning a reasoning request key is a definitive client response,
+        // not a stalled router. Surface it even when the stricter fallback classifiers
+        // reject it, so the provider's real validation error is not replaced by a stall.
+        // Other failures keep the stall retry path.
+        const status = Number((error as { status?: unknown })?.status);
+        const mentionsReasoningObject = /\breasoning(?:[_-][\w.-]*)?\b/i.test(
+          errorMessage(error)
+        );
+        if (
+          request.reasoning !== undefined &&
+          (isUnsupportedReasoningEffortError(error, request.reasoning.effort) ||
+            isInvalidReasoningEffortError(error, request.reasoning.effort) ||
+            ((status === 400 || status === 422) && mentionsReasoningObject))
+        ) {
+          throw error;
+        }
         throw openRouterStallError(firstChunkMs);
       }
       throw error;
@@ -229,8 +310,8 @@ export class LLMClient {
     systemPrompt: string,
     userContent: string,
     jsonResponseMode: boolean
-  ): OpenAI.Chat.Completions.ChatCompletionCreateParams {
-    const request: OpenAI.Chat.Completions.ChatCompletionCreateParams = {
+  ): OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest {
+    const request: OpenAI.Chat.Completions.ChatCompletionCreateParams & OpenRouterReasoningRequest = {
       model: this.model,
       messages: [
         { role: "system", content: systemPrompt },
@@ -245,6 +326,13 @@ export class LLMClient {
 
     if (jsonResponseMode) {
       request.response_format = { type: "json_object" };
+    }
+
+    if (this.reasoningEffort && !this.reasoningFallbackActive) {
+      request.reasoning = {
+        effort: this.reasoningEffort,
+        exclude: true,
+      };
     }
 
     if (this.routerModel) {

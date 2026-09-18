@@ -36,6 +36,10 @@ inputs:
     description: "Optional maximum tokens for the LLM response. Leave empty to use the provider/model default."
     required: false
     default: ""
+  reasoning-effort:
+    description: "Optional reasoning effort using the OpenRouter-style reasoning object, for providers/models that accept it (for example low, medium, high, xhigh, or max). Leave empty to omit reasoning configuration entirely or to defer to .github/robin.yml; unsupported or invalid values retry once with no reasoning override and leave a status warning."
+    required: false
+    default: ""
   llm-timeout-ms:
     description: "Timeout in milliseconds for LLM requests. Default is 10 minutes (600000 ms). Increase if you frequently see 'Request timed out' with large diffs."
     required: false

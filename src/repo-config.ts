@@ -9,6 +9,27 @@ export interface RepoConfig {
   skipPaths?: string[];
   jsonResponseMode?: boolean;
   requestChanges?: boolean;
+  reasoningEffort?: string;
+}
+
+/** Strips a trailing ` # comment` only outside quotes, so quoted values keep `#` intact. */
+function stripTrailingComment(line: string): string {
+  let quote: string | undefined;
+  for (let index = 0; index < line.length; index += 1) {
+    const char = line[index];
+    if (quote) {
+      if (char === "\\") {
+        index += 1;
+        continue;
+      }
+      if (char === quote) quote = undefined;
+    } else if (char === '"' || char === "'") {
+      quote = char;
+    } else if (char === "#" && index > 0 && /\s/.test(line[index - 1])) {
+      return line.slice(0, index).trimEnd();
+    }
+  }
+  return line;
 }
 
 export function parseRepoConfigYaml(text: string): RepoConfig {
@@ -36,27 +57,47 @@ export function parseRepoConfigYaml(text: string): RepoConfig {
       inSkipPaths = false;
     }
 
-    const maxDiffMatch = trimmed.match(/^max-diff-size:\s*(\d+)\s*$/i);
+    // Scalar settings tolerate the inline comments the shipped examples use
+    // (`reasoning-effort: high   # provider note`); a `#` inside a quoted value is kept.
+    const setting = stripTrailingComment(trimmed);
+
+    const maxDiffMatch = setting.match(/^max-diff-size:\s*(\d+)\s*$/i);
     if (maxDiffMatch) {
       config.maxDiffSize = parseInt(maxDiffMatch[1], 10);
       continue;
     }
 
-    const maxCommentsMatch = trimmed.match(/^max-comments:\s*(\d+)\s*$/i);
+    const maxCommentsMatch = setting.match(/^max-comments:\s*(\d+)\s*$/i);
     if (maxCommentsMatch) {
       config.maxComments = parseInt(maxCommentsMatch[1], 10);
       continue;
     }
 
-    const jsonModeMatch = trimmed.match(/^json-response-mode:\s*(true|false)\s*$/i);
+    const jsonModeMatch = setting.match(/^json-response-mode:\s*(true|false)\s*$/i);
     if (jsonModeMatch) {
       config.jsonResponseMode = jsonModeMatch[1].toLowerCase() === "true";
       continue;
     }
 
-    const requestChangesMatch = trimmed.match(/^request-changes:\s*(true|false)\s*$/i);
+    const requestChangesMatch = setting.match(/^request-changes:\s*(true|false)\s*$/i);
     if (requestChangesMatch) {
       config.requestChanges = requestChangesMatch[1].toLowerCase() === "true";
+      continue;
+    }
+
+    const reasoningEffortMatch = setting.match(
+      /^reasoning-effort:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(.+))\s*$/i
+    );
+    if (reasoningEffortMatch) {
+      const quotedValue = reasoningEffortMatch[1] ?? reasoningEffortMatch[2];
+      const value = (
+        quotedValue !== undefined
+          ? quotedValue.replace(/\\(.)/g, "$1")
+          : reasoningEffortMatch[3] ?? ""
+      ).trim();
+      if (value) {
+        config.reasoningEffort = value;
+      }
       continue;
     }
   }
@@ -97,4 +138,14 @@ export function resolveRequestChanges(actionInput: string, repoConfig?: RepoConf
   if (actionInput === "true") return true;
   if (actionInput === "false") return false;
   return repoConfig?.requestChanges ?? true;
+}
+
+/** Reasoning effort is provider configuration: explicit input first, then `.github/robin.yml`, else unset. */
+export function resolveReasoningEffort(
+  actionInput: string,
+  repoConfig?: RepoConfig
+): string | undefined {
+  const trimmed = actionInput.trim();
+  if (trimmed) return trimmed;
+  return repoConfig?.reasoningEffort;
 }

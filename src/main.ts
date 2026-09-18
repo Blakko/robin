@@ -1,6 +1,10 @@
 import * as core from "@actions/core";
 import * as github from "@actions/github";
 import { LLMClient } from "./llm-client";
+import {
+  buildReasoningFallbackNotice,
+  ReasoningFallbackReason,
+} from "./reasoning-fallback";
 import { GitUtils } from "./git-utils";
 import { ReviewParser, StructuredReview } from "./review-parser";
 import { shouldRetryStructuredReview } from "./review-retry";
@@ -20,6 +24,7 @@ import {
   resolveJsonResponseMode,
   resolveMaxComments,
   resolveMaxDiffSize,
+  resolveReasoningEffort,
   resolveRequestChanges,
 } from "./repo-config";
 import { getReviewPrompt, getSummaryPrompt, getHelpMessage } from "./prompts/review-prompts";
@@ -127,6 +132,7 @@ async function run(): Promise<void> {
     const maxCommentsInput = core.getInput("max-comments") || "25";
     const maxOutputTokensInput = core.getInput("max-output-tokens") || "";
     const maxOutputTokens = maxOutputTokensInput ? parseInt(maxOutputTokensInput, 10) : undefined;
+    const reasoningEffortInput = core.getInput("reasoning-effort") || "";
     const llmTimeoutMsInput = core.getInput("llm-timeout-ms") || "";
     const { value: llmTimeoutMs, valid: llmTimeoutValid } = parseLLMTimeout(llmTimeoutMsInput);
     if (!llmTimeoutValid) {
@@ -200,6 +206,10 @@ async function run(): Promise<void> {
     const maxComments = resolveMaxComments(maxCommentsInput, repoConfig);
     const jsonResponseMode = resolveJsonResponseMode(jsonResponseModeInput, repoConfig);
     const requestChanges = resolveRequestChanges(requestChangesInput, repoConfig);
+    const reasoningEffort = resolveReasoningEffort(reasoningEffortInput, repoConfig);
+    if (reasoningEffort) {
+      core.info(`Reasoning effort: ${reasoningEffort}`);
+    }
 
     const diff = await gitUtils.getPullRequestDiff(owner, repo, prNumber);
     
@@ -282,7 +292,8 @@ async function run(): Promise<void> {
           statusCommentId,
           buildProgressStatusBody(detail, statusCommand, statusModel)
         );
-      }
+      },
+      reasoningEffort
     );
     const useJsonMode = command === "review" && jsonResponseMode;
     
@@ -301,7 +312,13 @@ async function run(): Promise<void> {
         issue_number: prNumber,
         body: ["## " + ROBIN_SIGNATURE + " · Summary", "", reviewText].join("\n"),
       });
-      await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary"));
+      await updateStatusComment(
+        octokit,
+        owner,
+        repo,
+        statusCommentId,
+        buildCompletedStatusBody("summary", undefined, llm.getReasoningFallbackReason())
+      );
     } else {
       // Full review parsed and posted as a review
       core.info("Parsing review response...");
@@ -337,7 +354,13 @@ async function run(): Promise<void> {
 
       const reviewer = new GitHubReviewer(octokit as any, maxComments);
       await reviewer.postReview(owner, repo, prNumber, findings, requestChanges);
-      await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings));
+      await updateStatusComment(
+        octokit,
+        owner,
+        repo,
+        statusCommentId,
+        buildCompletedStatusBody("review", findings, llm.getReasoningFallbackReason())
+      );
 
       if (findings.high.length > 0 && failOnHigh) {
         core.setFailed(`Found ${findings.high.length} high severity issue(s). Failing check.`);
@@ -428,12 +451,18 @@ async function updateStatusComment(
   }
 }
 
-function buildCompletedStatusBody(command: "review" | "summary", findings?: StructuredReview): string {
+function buildCompletedStatusBody(
+  command: "review" | "summary",
+  findings?: StructuredReview,
+  reasoningFallbackReason?: ReasoningFallbackReason
+): string {
+  const fallbackNotice = buildReasoningFallbackNotice(reasoningFallbackReason);
   if (command === "summary") {
     return [
       "## " + ROBIN_SIGNATURE,
       "",
       ":white_check_mark: Summary's ready above.",
+      ...(fallbackNotice ? ["", fallbackNotice] : []),
       "",
       "Want the full review? Comment `/robin`.",
     ].join("\n");
@@ -450,6 +479,7 @@ function buildCompletedStatusBody(command: "review" | "summary", findings?: Stru
     "## " + ROBIN_SIGNATURE,
     "",
     `:white_check_mark: Review done. ${result}`,
+    ...(fallbackNotice ? ["", fallbackNotice] : []),
     "",
     "Push fixes whenever you like, then comment `/robin` for another pass.",
   ].join("\n");

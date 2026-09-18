@@ -1,8 +1,10 @@
 import {
   computeRetryDelayMs,
   getLlmCompletionAttemptCount,
+  isInvalidReasoningEffortError,
   isOpenRouterRouterModel,
   isRetriableLlmError,
+  isUnsupportedReasoningEffortError,
   openRouterStallError,
   resolveLlmTimeoutMs,
   shouldUseJsonResponseMode,
@@ -73,6 +75,367 @@ describe("isRetriableLlmError", () => {
     ).toBe(true);
     expect(isRetriableLlmError({ status: 404 }, { model: "openrouter/free" })).toBe(true);
     expect(isRetriableLlmError({ status: 404 }, { model: "gpt-4o" })).toBe(false);
+  });
+});
+
+describe("isUnsupportedReasoningEffortError", () => {
+  it("detects 400/422 responses that report the reasoning/effort parameter as unknown", () => {
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Unsupported parameter: 'reasoning' is not supported with this model",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError(
+        Object.assign(new Error("reasoning_effort is not supported"), { status: 422 })
+      )
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({ status: 400, message: "Unknown parameter: effort" })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Unrecognized request argument supplied: reasoning",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "This model does not support reasoning",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "The reasoning effort control is not supported for this model",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning not supported by this model",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "The reasoning parameter is not allowed for this model",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 422,
+        message: "reasoning: Extra inputs are not permitted",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: 'Unknown name "reasoning": Cannot bind field.',
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message:
+          "Invalid JSON payload received. Unknown name \"reasoning\" at 'reasoning': Cannot find field.",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 422,
+        message: "reasoning: Input should be a valid string",
+      })
+    ).toBe(true);
+  });
+
+  it("lets an explicit parameter rejection win over value words elsewhere", () => {
+    expect(
+      isUnsupportedReasoningEffortError(
+        {
+          status: 400,
+          message: "Unsupported parameter: reasoning; valid values are low, medium, high",
+        },
+        "low"
+      )
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError(
+        { status: 400, message: "This model does not support high-effort reasoning" },
+        "high"
+      )
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError(
+        { status: 400, message: "reasoning is not supported with this model for effort high" },
+        "high"
+      )
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning is not one of the supported parameters",
+      })
+    ).toBe(true);
+  });
+
+  it("does not cross a comma from an unrelated rejected parameter", () => {
+    expect(
+      isUnsupportedReasoningEffortError(
+        {
+          status: 400,
+          message: "Unsupported parameter: temperature, reasoning models require temperature 1",
+        },
+        "high"
+      )
+    ).toBe(false);
+  });
+
+  it("keeps a mixed invalid-value message on the value path", () => {
+    const mixed = {
+      status: 400,
+      message: "Unsupported value for parameter reasoning: must be one of low, medium, high",
+    };
+    expect(isUnsupportedReasoningEffortError(mixed, "extreme")).toBe(false);
+    expect(isUnsupportedReasoningEffortError(mixed, "low")).toBe(false);
+  });
+
+  it("keeps a structured-param value complaint on the value path", () => {
+    expect(
+      isUnsupportedReasoningEffortError(
+        {
+          status: 400,
+          message: "Invalid value: 'extreme'. Supported values are: low, medium, high",
+          param: "reasoning_effort",
+        },
+        "extreme"
+      )
+    ).toBe(false);
+  });
+
+  it("matches explicit parameter rejections with underscored and hyphenated names", () => {
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Unsupported parameter: reasoning_effort",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 422,
+        message: "reasoning-effort is not supported",
+      })
+    ).toBe(true);
+  });
+
+  it("matches an explicit rejection of reasoning controls", () => {
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 422,
+        message: "reasoning controls rejected by the selected provider",
+      })
+    ).toBe(true);
+  });
+
+  it("uses a structured param naming the reasoning field when message text is inconclusive", () => {
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Request validation failed",
+        param: "reasoning_effort",
+      })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Invalid value for 'reasoning_effort': 'extreme'",
+        param: "reasoning_effort",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Request validation failed",
+        param: "temperature",
+      })
+    ).toBe(false);
+  });
+
+  it("treats a message repeating the configured effort value as a value complaint", () => {
+    const valueRejection = {
+      status: 400,
+      message: "reasoning effort 'extreme' is not supported by this model",
+    };
+    expect(isUnsupportedReasoningEffortError(valueRejection, "extreme")).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError(
+        { status: 400, message: "reasoning is not supported with this model" },
+        "extreme"
+      )
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError(
+        { status: 400, message: "Unsupported parameter: reasoning; follow the docs" },
+        "low"
+      )
+    ).toBe(true);
+  });
+
+  it("detects a rejected exclude sub-key of the reasoning request", () => {
+    expect(
+      isUnsupportedReasoningEffortError({ status: 400, message: "Unsupported parameter: exclude" })
+    ).toBe(true);
+    expect(
+      isUnsupportedReasoningEffortError({ status: 400, message: "Invalid API key" })
+    ).toBe(false);
+  });
+
+  it("ignores auth, rate-limit, server, timeout, and unrelated validation errors", () => {
+    expect(
+      isUnsupportedReasoningEffortError({ status: 401, message: "Invalid API key" })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({ status: 429, message: "reasoning rate limit" })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({ status: 500, message: "reasoning backend failed" })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({ status: 400, message: "Invalid temperature" })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "temperature 2 is not supported; reasoning models require 1",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "temperature 2 is not supported for reasoning models",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning models do not support temperature 0.1",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Unknown parameter: temperature; reasoning models require temperature 1",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "This model does not support temperature; reasoning models need 1",
+      })
+    ).toBe(false);
+    expect(isUnsupportedReasoningEffortError(new Error("reasoning rejected"))).toBe(false);
+    expect(isUnsupportedReasoningEffortError(undefined)).toBe(false);
+  });
+
+  it("does not treat invalid, out-of-range, or missing reasoning values as unsupported", () => {
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning effort must be one of low, medium, high",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning effort should be one of low, medium, high",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 422,
+        message: "reasoning_effort: invalid value; expected one of low, medium, high",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Invalid value for 'reasoning_effort': 'extreme' is not one of [low, medium, high]",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning_effort 'extreme' is not allowed; use low, medium, or high",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning effort out of range: allowed values are low, medium, high",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "Missing required parameter: reasoning_effort",
+      })
+    ).toBe(false);
+    expect(
+      isUnsupportedReasoningEffortError({
+        status: 400,
+        message: "reasoning effort is required",
+      })
+    ).toBe(false);
+  });
+});
+
+describe("isInvalidReasoningEffortError", () => {
+  it("detects clear reasoning-effort value rejections", () => {
+    expect(
+      isInvalidReasoningEffortError(
+        { status: 400, message: "reasoning effort must be one of low, medium, high" },
+        "extreme"
+      )
+    ).toBe(true);
+    expect(
+      isInvalidReasoningEffortError(
+        {
+          status: 422,
+          message: "Invalid value: 'extreme'. Supported values are low, medium, high",
+          param: "reasoning_effort",
+        },
+        "extreme"
+      )
+    ).toBe(true);
+    expect(
+      isInvalidReasoningEffortError(
+        { status: 400, message: "reasoning effort 'extreme' is not supported by this model" },
+        "extreme"
+      )
+    ).toBe(true);
+  });
+
+  it("does not mask unsupported parameters or unrelated failures", () => {
+    expect(
+      isInvalidReasoningEffortError(
+        { status: 400, message: "Unsupported parameter: reasoning" },
+        "high"
+      )
+    ).toBe(false);
+    expect(
+      isInvalidReasoningEffortError(
+        { status: 400, message: "Invalid temperature: only 1 is allowed" },
+        "high"
+      )
+    ).toBe(false);
+    expect(
+      isInvalidReasoningEffortError(
+        { status: 401, message: "Invalid reasoning effort" },
+        "high"
+      )
+    ).toBe(false);
   });
 });
 

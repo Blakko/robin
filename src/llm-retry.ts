@@ -32,6 +32,136 @@ export function isOpenRouterProviderError(error: unknown): boolean {
   return message.includes("provider returned error");
 }
 
+export function errorMessage(error: unknown): string {
+  if (error instanceof Error) return error.message;
+  if (
+    typeof error === "object" &&
+    error !== null &&
+    typeof (error as { message?: unknown }).message === "string"
+  ) {
+    return (error as { message: string }).message;
+  }
+  return String(error);
+}
+
+/**
+ * Explicit parameter rejections that name the extra parameter. These win over the value
+ * bail-outs so an explicit rejection is not masked by an incidental value word later in
+ * the message (for example a provider that echoes the configured value while rejecting
+ * the parameter itself).
+ */
+const EXPLICIT_UNSUPPORTED_PARAMETER_PHRASES: RegExp[] = [
+  // The parameter noun must follow the adjective directly: "Unsupported value for parameter
+  // reasoning" is a value complaint, while "Unsupported parameter: reasoning" is not. The gap
+  // can cross a colon that introduces the field name, but not a comma or clause-ending
+  // punctuation, so an unrelated parameter named before a separate "reasoning" clause
+  // does not match.
+  /\b(?:unsupported|unknown|unrecognized|unrecognised)\s+(?:parameter|argument|field|property|option|input|feature)\b[^.;!?,]{0,40}\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i,
+  /\b(?:does|do|did)\s+not\s+support\b[^.;!?]{0,30}\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i,
+  // The parameter itself is the subject: a value echo later in the message is incidental.
+  /\b(?:reasoning|effort|exclude)(?:[\w.-]*)\s+(?:is|are|was|were)\s+(?:not\s+supported|unsupported)\b/i,
+  /\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b\s+(?:is|are|was|were)\s+not\s+one\s+of\s+(?:the\s+)?(?:supported|allowed|known|recognized|recognised)\s+(?:parameters?|arguments?|fields?|properties|options?|inputs?|features?)\b/i,
+  /\b(?:reasoning(?:[_-]?(?:effort|exclude))?|reasoning\s+(?:controls?|parameters?|fields?)|effort|exclude)\b\s+(?:(?:is|are|was|were|has\s+been|have\s+been)\s+)?(?:rejected|refused)\b/i,
+];
+
+/** Provider phrases meaning the extra parameter itself is unknown, not that its value is bad. */
+const UNSUPPORTED_PARAMETER_PHRASES: RegExp[] = [
+  /(?:unsupported|unknown|unrecognized|unrecognised|unexpected)(?:\s+\w+){0,2}\s+(?:parameter|argument|field|property|option|input|feature)\b[^.;!?,]{0,30}\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i,
+  /\bunknown\s+name\b/i,
+  /\bcannot\s+(?:bind|find)\s+(?:the\s+)?(?:field|property|parameter)\b/i,
+  /(?:parameter|argument|field|property|option|input|feature)\b[^.!?]{0,40}\b(?:unsupported|unknown|unrecognized|unrecognised|unexpected)\b/i,
+  /\b(?:reasoning|effort|exclude)(?:[\w.-]*)(?:\s+\w+){0,3}\s+(?:is|are|was|were)\s+(?:not\s+supported|unsupported)\b/i,
+  /\b(?:reasoning|effort|exclude)(?:[\w.-]*)(?:\s+\w+){0,3}\s+(?:(?:is|are|was|were)\s+)?not\s+supported\s+(?:by|for|with|in|on)\b/i,
+  /\b(?:parameter|argument|field|property|option|feature)\b[^.!?]{0,30}\b(?:is|are|was|were)\s+not\s+(?:allowed|permitted|recognized|recognised)\b/i,
+  /\bextra\s+(?:inputs?|fields?|properties|arguments?|parameters?)\b/i,
+];
+
+/** Schema/shape complaints about the reasoning field itself, not about its configured value. */
+const SHAPE_MISMATCH_PHRASES: RegExp[] = [
+  /\binput should be (?:a|an)\s+(?:valid\s+)?(?:string|object|boolean|number|array)\b/i,
+];
+
+/** Malformed-value signals: these must keep failing rather than mask a configuration typo. */
+const INVALID_VALUE_PHRASES: RegExp[] = [
+  /\binvalid\s+(?:value|type|format)\b/i,
+  /\b(?:must|should|needs?\s+to)\s+be\s+(?:one\s+of|between|greater|less|at\s+most|at\s+least|a|an)\b/i,
+  /\b(?:expected|not)\s+one\s+of\b/i,
+  /\bout\s+of\s+range\b/i,
+  /\b(?:valid|allowed)\s+values?\s+(?:are|is)\b/i,
+  /\bnot\s+a\s+valid\b/i,
+];
+
+/**
+ * True only for a client validation response (400/422) that reports the reasoning
+ * configuration itself as unknown, unsupported, or of the wrong shape — the cases where
+ * dropping the reasoning parameter and retrying is safe. Explicit parameter rejections and
+ * a structured `param` naming the reasoning field win over the value bail-outs; invalid
+ * effort values, missing values, and generic validation errors must surface normally.
+ */
+export function isUnsupportedReasoningEffortError(error: unknown, sentEffort?: string): boolean {
+  if (!error || typeof error !== "object") return false;
+  const status = Number((error as { status?: unknown }).status);
+  if (status !== 400 && status !== 422) return false;
+  const message = errorMessage(error);
+
+  if (EXPLICIT_UNSUPPORTED_PARAMETER_PHRASES.some((pattern) => pattern.test(message))) {
+    return true;
+  }
+
+  const mentionsReasoning = /\b(?:reasoning|effort|exclude)/i.test(message);
+  if (mentionsReasoning && sentEffort && mentionsEffortValue(message, sentEffort)) return false;
+  if (mentionsReasoning && SHAPE_MISMATCH_PHRASES.some((pattern) => pattern.test(message))) {
+    return true;
+  }
+  // Value complaints must win over a structured param: a param-only invalid-value message
+  // may not mention the key at all.
+  if (INVALID_VALUE_PHRASES.some((pattern) => pattern.test(message))) {
+    return false;
+  }
+  if (structuredReasoningParam(error)) return true;
+  if (!mentionsReasoning) return false;
+  return UNSUPPORTED_PARAMETER_PHRASES.some((pattern) => pattern.test(message));
+}
+
+/**
+ * True only when a 400/422 response clearly rejects the configured reasoning-effort
+ * value. These errors are safe to recover from by omitting the optional reasoning object,
+ * while unrelated validation failures must still surface normally.
+ */
+export function isInvalidReasoningEffortError(error: unknown, sentEffort?: string): boolean {
+  if (!error || typeof error !== "object") return false;
+  const status = Number((error as { status?: unknown }).status);
+  if (status !== 400 && status !== 422) return false;
+  if (isUnsupportedReasoningEffortError(error, sentEffort)) return false;
+
+  const message = errorMessage(error);
+  const mentionsReasoning = /\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i.test(message);
+  if (!mentionsReasoning && !structuredReasoningParam(error)) return false;
+
+  if (INVALID_VALUE_PHRASES.some((pattern) => pattern.test(message))) return true;
+
+  // Some providers describe a model-specific value rejection as "not supported" and
+  // echo the submitted value instead of listing the accepted values.
+  return Boolean(
+    sentEffort &&
+      mentionsEffortValue(message, sentEffort) &&
+      /\b(?:invalid|unsupported|not\s+(?:supported|allowed|recognized|recognised))\b/i.test(message)
+  );
+}
+
+/** Word-boundary match so short values like `low` or `max` cannot hit `follow` or `maximum`. */
+function mentionsEffortValue(message: string, effort: string): boolean {
+  const escaped = effort.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  return new RegExp(`(?:^|\\W)${escaped}(?:$|\\W)`, "i").test(message);
+}
+
+/** OpenAI-compatible SDK errors may name the offending parameter structurally. */
+function structuredReasoningParam(error: unknown): boolean {
+  if (!error || typeof error !== "object") return false;
+  const param = (error as { param?: unknown }).param;
+  return typeof param === "string" && /\b(?:reasoning|effort|exclude)/i.test(param);
+}
+
 export function isRetriableLlmError(error: unknown, context: LlmRetryContext = {}): boolean {
   if (!error) return false;
 

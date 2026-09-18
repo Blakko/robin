@@ -682,11 +682,15 @@ class LLMClient {
     routerModel;
     temperature;
     onProgress;
-    constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress) {
+    reasoningEffort;
+    reasoningFallbackActive = false;
+    reasoningFallbackReason;
+    constructor(baseUrl, apiKey, model, maxOutputTokens, timeoutMs = config_1.DEFAULT_LLM_TIMEOUT_MS, maxAttempts = config_1.DEFAULT_LLM_COMPLETION_ATTEMPTS, temperature = config_1.DEFAULT_LLM_TEMPERATURE, onProgress, reasoningEffort) {
         this.model = model;
         this.temperature = temperature;
         this.routerModel = (0, llm_retry_1.isOpenRouterRouterModel)(model);
         this.onProgress = onProgress;
+        this.reasoningEffort = reasoningEffort?.trim() || undefined;
         this.maxOutputTokens =
             maxOutputTokens && Number.isFinite(maxOutputTokens) && maxOutputTokens > 0
                 ? maxOutputTokens
@@ -708,6 +712,9 @@ class LLMClient {
     retryContext() {
         return { model: this.model };
     }
+    getReasoningFallbackReason() {
+        return this.reasoningFallbackReason;
+    }
     async progress(detail) {
         if (!this.onProgress)
             return;
@@ -726,10 +733,7 @@ class LLMClient {
             try {
                 core.info(`LLM attempt ${attempt}/${this.maxAttempts}: waiting for provider...`);
                 await this.progress(`Waiting for provider (attempt ${attempt}/${this.maxAttempts})…`);
-                const request = this.buildRequest(systemPrompt, userContent, useJson);
-                const { content, model: resolvedModel } = this.routerModel
-                    ? await this.streamChatCompletion(request)
-                    : await this.blockingChatCompletion(request);
+                const { content, model: resolvedModel } = await this.performRequest(systemPrompt, userContent, useJson);
                 if (content) {
                     if (!this.routerModel) {
                         this.logResolvedModel(resolvedModel || this.model);
@@ -760,6 +764,41 @@ class LLMClient {
             throw new Error(`Failed to get response from LLM after ${this.maxAttempts} attempts: ${lastError}`);
         }
         throw new Error(`Empty response from LLM after ${this.maxAttempts} attempts (finish_reason=${lastFinishReason})`);
+    }
+    /**
+     * One completion request. If the provider rejects the reasoning parameter as
+     * unsupported or rejects its configured value, warn and retry once without it;
+     * the fallback then stays off so normal retry attempts are not multiplied.
+     */
+    async performRequest(systemPrompt, userContent, jsonResponseMode) {
+        try {
+            return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
+        }
+        catch (error) {
+            if (this.reasoningFallbackActive || !this.reasoningEffort) {
+                throw error;
+            }
+            const fallbackReason = (0, llm_retry_1.isUnsupportedReasoningEffortError)(error, this.reasoningEffort)
+                ? "unsupported"
+                : (0, llm_retry_1.isInvalidReasoningEffortError)(error, this.reasoningEffort)
+                    ? "invalid-value"
+                    : undefined;
+            if (!fallbackReason)
+                throw error;
+            this.reasoningFallbackActive = true;
+            this.reasoningFallbackReason = fallbackReason;
+            core.warning(`Provider rejected the configured reasoning effort as ${fallbackReason === "invalid-value" ? "invalid" : "unsupported"} (${(0, llm_retry_1.errorMessage)(error)}). ` +
+                "Retrying once without the reasoning parameter and continuing this run without reasoning controls.");
+            await this.progress(fallbackReason === "invalid-value"
+                ? "Provider rejected the configured reasoning effort — retrying without it…"
+                : "Provider rejected reasoning controls — retrying without them…");
+            return await this.dispatch(this.buildRequest(systemPrompt, userContent, jsonResponseMode));
+        }
+    }
+    async dispatch(request) {
+        return this.routerModel
+            ? await this.streamChatCompletion(request)
+            : await this.blockingChatCompletion(request);
     }
     async blockingChatCompletion(request) {
         const response = await this.client.chat.completions.create({
@@ -817,6 +856,18 @@ class LLMClient {
         catch (error) {
             clearStallTimer();
             if (!gotFirstChunk) {
+                // A 400/422 mentioning a reasoning request key is a definitive client response,
+                // not a stalled router. Surface it even when the stricter fallback classifiers
+                // reject it, so the provider's real validation error is not replaced by a stall.
+                // Other failures keep the stall retry path.
+                const status = Number(error?.status);
+                const mentionsReasoningObject = /\breasoning(?:[_-][\w.-]*)?\b/i.test((0, llm_retry_1.errorMessage)(error));
+                if (request.reasoning !== undefined &&
+                    ((0, llm_retry_1.isUnsupportedReasoningEffortError)(error, request.reasoning.effort) ||
+                        (0, llm_retry_1.isInvalidReasoningEffortError)(error, request.reasoning.effort) ||
+                        ((status === 400 || status === 422) && mentionsReasoningObject))) {
+                    throw error;
+                }
                 throw (0, llm_retry_1.openRouterStallError)(firstChunkMs);
             }
             throw error;
@@ -836,6 +887,12 @@ class LLMClient {
         }
         if (jsonResponseMode) {
             request.response_format = { type: "json_object" };
+        }
+        if (this.reasoningEffort && !this.reasoningFallbackActive) {
+            request.reasoning = {
+                effort: this.reasoningEffort,
+                exclude: true,
+            };
         }
         if (this.routerModel) {
             // OpenRouter extension: try other providers when the first free route 404s.
@@ -879,6 +936,9 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 exports.resolveLlmTimeoutMs = resolveLlmTimeoutMs;
 exports.isOpenRouterRouterModel = isOpenRouterRouterModel;
 exports.isOpenRouterProviderError = isOpenRouterProviderError;
+exports.errorMessage = errorMessage;
+exports.isUnsupportedReasoningEffortError = isUnsupportedReasoningEffortError;
+exports.isInvalidReasoningEffortError = isInvalidReasoningEffortError;
 exports.isRetriableLlmError = isRetriableLlmError;
 exports.shouldUseJsonResponseMode = shouldUseJsonResponseMode;
 exports.computeRetryDelayMs = computeRetryDelayMs;
@@ -903,6 +963,130 @@ function isOpenRouterRouterModel(model) {
 function isOpenRouterProviderError(error) {
     const message = (error instanceof Error ? error.message : String(error)).toLowerCase();
     return message.includes("provider returned error");
+}
+function errorMessage(error) {
+    if (error instanceof Error)
+        return error.message;
+    if (typeof error === "object" &&
+        error !== null &&
+        typeof error.message === "string") {
+        return error.message;
+    }
+    return String(error);
+}
+/**
+ * Explicit parameter rejections that name the extra parameter. These win over the value
+ * bail-outs so an explicit rejection is not masked by an incidental value word later in
+ * the message (for example a provider that echoes the configured value while rejecting
+ * the parameter itself).
+ */
+const EXPLICIT_UNSUPPORTED_PARAMETER_PHRASES = [
+    // The parameter noun must follow the adjective directly: "Unsupported value for parameter
+    // reasoning" is a value complaint, while "Unsupported parameter: reasoning" is not. The gap
+    // can cross a colon that introduces the field name, but not a comma or clause-ending
+    // punctuation, so an unrelated parameter named before a separate "reasoning" clause
+    // does not match.
+    /\b(?:unsupported|unknown|unrecognized|unrecognised)\s+(?:parameter|argument|field|property|option|input|feature)\b[^.;!?,]{0,40}\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i,
+    /\b(?:does|do|did)\s+not\s+support\b[^.;!?]{0,30}\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i,
+    // The parameter itself is the subject: a value echo later in the message is incidental.
+    /\b(?:reasoning|effort|exclude)(?:[\w.-]*)\s+(?:is|are|was|were)\s+(?:not\s+supported|unsupported)\b/i,
+    /\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b\s+(?:is|are|was|were)\s+not\s+one\s+of\s+(?:the\s+)?(?:supported|allowed|known|recognized|recognised)\s+(?:parameters?|arguments?|fields?|properties|options?|inputs?|features?)\b/i,
+    /\b(?:reasoning(?:[_-]?(?:effort|exclude))?|reasoning\s+(?:controls?|parameters?|fields?)|effort|exclude)\b\s+(?:(?:is|are|was|were|has\s+been|have\s+been)\s+)?(?:rejected|refused)\b/i,
+];
+/** Provider phrases meaning the extra parameter itself is unknown, not that its value is bad. */
+const UNSUPPORTED_PARAMETER_PHRASES = [
+    /(?:unsupported|unknown|unrecognized|unrecognised|unexpected)(?:\s+\w+){0,2}\s+(?:parameter|argument|field|property|option|input|feature)\b[^.;!?,]{0,30}\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i,
+    /\bunknown\s+name\b/i,
+    /\bcannot\s+(?:bind|find)\s+(?:the\s+)?(?:field|property|parameter)\b/i,
+    /(?:parameter|argument|field|property|option|input|feature)\b[^.!?]{0,40}\b(?:unsupported|unknown|unrecognized|unrecognised|unexpected)\b/i,
+    /\b(?:reasoning|effort|exclude)(?:[\w.-]*)(?:\s+\w+){0,3}\s+(?:is|are|was|were)\s+(?:not\s+supported|unsupported)\b/i,
+    /\b(?:reasoning|effort|exclude)(?:[\w.-]*)(?:\s+\w+){0,3}\s+(?:(?:is|are|was|were)\s+)?not\s+supported\s+(?:by|for|with|in|on)\b/i,
+    /\b(?:parameter|argument|field|property|option|feature)\b[^.!?]{0,30}\b(?:is|are|was|were)\s+not\s+(?:allowed|permitted|recognized|recognised)\b/i,
+    /\bextra\s+(?:inputs?|fields?|properties|arguments?|parameters?)\b/i,
+];
+/** Schema/shape complaints about the reasoning field itself, not about its configured value. */
+const SHAPE_MISMATCH_PHRASES = [
+    /\binput should be (?:a|an)\s+(?:valid\s+)?(?:string|object|boolean|number|array)\b/i,
+];
+/** Malformed-value signals: these must keep failing rather than mask a configuration typo. */
+const INVALID_VALUE_PHRASES = [
+    /\binvalid\s+(?:value|type|format)\b/i,
+    /\b(?:must|should|needs?\s+to)\s+be\s+(?:one\s+of|between|greater|less|at\s+most|at\s+least|a|an)\b/i,
+    /\b(?:expected|not)\s+one\s+of\b/i,
+    /\bout\s+of\s+range\b/i,
+    /\b(?:valid|allowed)\s+values?\s+(?:are|is)\b/i,
+    /\bnot\s+a\s+valid\b/i,
+];
+/**
+ * True only for a client validation response (400/422) that reports the reasoning
+ * configuration itself as unknown, unsupported, or of the wrong shape — the cases where
+ * dropping the reasoning parameter and retrying is safe. Explicit parameter rejections and
+ * a structured `param` naming the reasoning field win over the value bail-outs; invalid
+ * effort values, missing values, and generic validation errors must surface normally.
+ */
+function isUnsupportedReasoningEffortError(error, sentEffort) {
+    if (!error || typeof error !== "object")
+        return false;
+    const status = Number(error.status);
+    if (status !== 400 && status !== 422)
+        return false;
+    const message = errorMessage(error);
+    if (EXPLICIT_UNSUPPORTED_PARAMETER_PHRASES.some((pattern) => pattern.test(message))) {
+        return true;
+    }
+    const mentionsReasoning = /\b(?:reasoning|effort|exclude)/i.test(message);
+    if (mentionsReasoning && sentEffort && mentionsEffortValue(message, sentEffort))
+        return false;
+    if (mentionsReasoning && SHAPE_MISMATCH_PHRASES.some((pattern) => pattern.test(message))) {
+        return true;
+    }
+    // Value complaints must win over a structured param: a param-only invalid-value message
+    // may not mention the key at all.
+    if (INVALID_VALUE_PHRASES.some((pattern) => pattern.test(message))) {
+        return false;
+    }
+    if (structuredReasoningParam(error))
+        return true;
+    if (!mentionsReasoning)
+        return false;
+    return UNSUPPORTED_PARAMETER_PHRASES.some((pattern) => pattern.test(message));
+}
+/**
+ * True only when a 400/422 response clearly rejects the configured reasoning-effort
+ * value. These errors are safe to recover from by omitting the optional reasoning object,
+ * while unrelated validation failures must still surface normally.
+ */
+function isInvalidReasoningEffortError(error, sentEffort) {
+    if (!error || typeof error !== "object")
+        return false;
+    const status = Number(error.status);
+    if (status !== 400 && status !== 422)
+        return false;
+    if (isUnsupportedReasoningEffortError(error, sentEffort))
+        return false;
+    const message = errorMessage(error);
+    const mentionsReasoning = /\b(?:reasoning|effort|exclude)(?:[_-][\w.-]*)?\b/i.test(message);
+    if (!mentionsReasoning && !structuredReasoningParam(error))
+        return false;
+    if (INVALID_VALUE_PHRASES.some((pattern) => pattern.test(message)))
+        return true;
+    // Some providers describe a model-specific value rejection as "not supported" and
+    // echo the submitted value instead of listing the accepted values.
+    return Boolean(sentEffort &&
+        mentionsEffortValue(message, sentEffort) &&
+        /\b(?:invalid|unsupported|not\s+(?:supported|allowed|recognized|recognised))\b/i.test(message));
+}
+/** Word-boundary match so short values like `low` or `max` cannot hit `follow` or `maximum`. */
+function mentionsEffortValue(message, effort) {
+    const escaped = effort.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    return new RegExp(`(?:^|\\W)${escaped}(?:$|\\W)`, "i").test(message);
+}
+/** OpenAI-compatible SDK errors may name the offending parameter structurally. */
+function structuredReasoningParam(error) {
+    if (!error || typeof error !== "object")
+        return false;
+    const param = error.param;
+    return typeof param === "string" && /\b(?:reasoning|effort|exclude)/i.test(param);
 }
 function isRetriableLlmError(error, context = {}) {
     if (!error)
@@ -1001,6 +1185,7 @@ Object.defineProperty(exports, "__esModule", ({ value: true }));
 const core = __importStar(__nccwpck_require__(7484));
 const github = __importStar(__nccwpck_require__(3228));
 const llm_client_1 = __nccwpck_require__(3316);
+const reasoning_fallback_1 = __nccwpck_require__(2432);
 const git_utils_1 = __nccwpck_require__(8529);
 const review_parser_1 = __nccwpck_require__(2141);
 const review_retry_1 = __nccwpck_require__(450);
@@ -1088,6 +1273,7 @@ async function run() {
         const maxCommentsInput = core.getInput("max-comments") || "25";
         const maxOutputTokensInput = core.getInput("max-output-tokens") || "";
         const maxOutputTokens = maxOutputTokensInput ? parseInt(maxOutputTokensInput, 10) : undefined;
+        const reasoningEffortInput = core.getInput("reasoning-effort") || "";
         const llmTimeoutMsInput = core.getInput("llm-timeout-ms") || "";
         const { value: llmTimeoutMs, valid: llmTimeoutValid } = (0, config_1.parseLLMTimeout)(llmTimeoutMsInput);
         if (!llmTimeoutValid) {
@@ -1140,6 +1326,10 @@ async function run() {
         const maxComments = (0, repo_config_1.resolveMaxComments)(maxCommentsInput, repoConfig);
         const jsonResponseMode = (0, repo_config_1.resolveJsonResponseMode)(jsonResponseModeInput, repoConfig);
         const requestChanges = (0, repo_config_1.resolveRequestChanges)(requestChangesInput, repoConfig);
+        const reasoningEffort = (0, repo_config_1.resolveReasoningEffort)(reasoningEffortInput, repoConfig);
+        if (reasoningEffort) {
+            core.info(`Reasoning effort: ${reasoningEffort}`);
+        }
         const diff = await gitUtils.getPullRequestDiff(owner, repo, prNumber);
         if (!diff || diff.trim().length === 0) {
             core.warning("No diff found for this PR.");
@@ -1171,7 +1361,7 @@ async function run() {
             : "";
         const llm = new llm_client_1.LLMClient(baseUrl, apiKey, model, maxOutputTokens, llmTimeoutMs, undefined, llmTemperature, async (detail) => {
             await updateStatusComment(octokit, owner, repo, statusCommentId, buildProgressStatusBody(detail, statusCommand, statusModel));
-        });
+        }, reasoningEffort);
         const useJsonMode = command === "review" && jsonResponseMode;
         let reviewText;
         if (command === "summary") {
@@ -1188,7 +1378,7 @@ async function run() {
                 issue_number: prNumber,
                 body: ["## " + github_reviewer_1.ROBIN_SIGNATURE + " · Summary", "", reviewText].join("\n"),
             });
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary"));
+            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("summary", undefined, llm.getReasoningFallbackReason()));
         }
         else {
             // Full review parsed and posted as a review
@@ -1205,7 +1395,7 @@ async function run() {
             core.info(`Found ${findings.high.length} high, ${findings.medium.length} medium, ${findings.low.length} low, ${findings.suggestions.length} suggestions`);
             const reviewer = new github_reviewer_1.GitHubReviewer(octokit, maxComments);
             await reviewer.postReview(owner, repo, prNumber, findings, requestChanges);
-            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings));
+            await updateStatusComment(octokit, owner, repo, statusCommentId, buildCompletedStatusBody("review", findings, llm.getReasoningFallbackReason()));
             if (findings.high.length > 0 && failOnHigh) {
                 core.setFailed(`Found ${findings.high.length} high severity issue(s). Failing check.`);
             }
@@ -1276,12 +1466,14 @@ async function updateStatusComment(octokit, owner, repo, commentId, body) {
         core.warning(`Could not update status comment: ${error}`);
     }
 }
-function buildCompletedStatusBody(command, findings) {
+function buildCompletedStatusBody(command, findings, reasoningFallbackReason) {
+    const fallbackNotice = (0, reasoning_fallback_1.buildReasoningFallbackNotice)(reasoningFallbackReason);
     if (command === "summary") {
         return [
             "## " + github_reviewer_1.ROBIN_SIGNATURE,
             "",
             ":white_check_mark: Summary's ready above.",
+            ...(fallbackNotice ? ["", fallbackNotice] : []),
             "",
             "Want the full review? Comment `/robin`.",
         ].join("\n");
@@ -1296,6 +1488,7 @@ function buildCompletedStatusBody(command, findings) {
         "## " + github_reviewer_1.ROBIN_SIGNATURE,
         "",
         `:white_check_mark: Review done. ${result}`,
+        ...(fallbackNotice ? ["", fallbackNotice] : []),
         "",
         "Push fixes whenever you like, then comment `/robin` for another pass.",
     ].join("\n");
@@ -1667,6 +1860,25 @@ function getHelpMessage() {
 
 /***/ }),
 
+/***/ 2432:
+/***/ ((__unused_webpack_module, exports) => {
+
+"use strict";
+
+Object.defineProperty(exports, "__esModule", ({ value: true }));
+exports.buildReasoningFallbackNotice = buildReasoningFallbackNotice;
+function buildReasoningFallbackNotice(reason) {
+    if (!reason)
+        return undefined;
+    const rejection = reason === "invalid-value" ? "rejected as invalid" : "rejected as unsupported";
+    return (`:warning: The configured \`reasoning-effort\` was ${rejection}. ` +
+        "Robin completed this run without a reasoning override. Update `.github/robin.yml` " +
+        "or the workflow `with: reasoning-effort` value.");
+}
+//# sourceMappingURL=reasoning-fallback.js.map
+
+/***/ }),
+
 /***/ 2800:
 /***/ ((__unused_webpack_module, exports) => {
 
@@ -1679,10 +1891,33 @@ exports.resolveMaxDiffSize = resolveMaxDiffSize;
 exports.resolveMaxComments = resolveMaxComments;
 exports.resolveJsonResponseMode = resolveJsonResponseMode;
 exports.resolveRequestChanges = resolveRequestChanges;
+exports.resolveReasoningEffort = resolveReasoningEffort;
 exports.DEFAULT_CONFIG_FILE = ".github/robin.yml";
 exports.DEFAULT_ACTION_MAX_DIFF_SIZE = 50000;
 /** Single default shared by action.yml and the reusable review.yml workflow. */
 exports.DEFAULT_MAX_COMMENTS = 15;
+/** Strips a trailing ` # comment` only outside quotes, so quoted values keep `#` intact. */
+function stripTrailingComment(line) {
+    let quote;
+    for (let index = 0; index < line.length; index += 1) {
+        const char = line[index];
+        if (quote) {
+            if (char === "\\") {
+                index += 1;
+                continue;
+            }
+            if (char === quote)
+                quote = undefined;
+        }
+        else if (char === '"' || char === "'") {
+            quote = char;
+        }
+        else if (char === "#" && index > 0 && /\s/.test(line[index - 1])) {
+            return line.slice(0, index).trimEnd();
+        }
+    }
+    return line;
+}
 function parseRepoConfigYaml(text) {
     const config = {};
     let inSkipPaths = false;
@@ -1705,24 +1940,38 @@ function parseRepoConfigYaml(text) {
             }
             inSkipPaths = false;
         }
-        const maxDiffMatch = trimmed.match(/^max-diff-size:\s*(\d+)\s*$/i);
+        // Scalar settings tolerate the inline comments the shipped examples use
+        // (`reasoning-effort: high   # provider note`); a `#` inside a quoted value is kept.
+        const setting = stripTrailingComment(trimmed);
+        const maxDiffMatch = setting.match(/^max-diff-size:\s*(\d+)\s*$/i);
         if (maxDiffMatch) {
             config.maxDiffSize = parseInt(maxDiffMatch[1], 10);
             continue;
         }
-        const maxCommentsMatch = trimmed.match(/^max-comments:\s*(\d+)\s*$/i);
+        const maxCommentsMatch = setting.match(/^max-comments:\s*(\d+)\s*$/i);
         if (maxCommentsMatch) {
             config.maxComments = parseInt(maxCommentsMatch[1], 10);
             continue;
         }
-        const jsonModeMatch = trimmed.match(/^json-response-mode:\s*(true|false)\s*$/i);
+        const jsonModeMatch = setting.match(/^json-response-mode:\s*(true|false)\s*$/i);
         if (jsonModeMatch) {
             config.jsonResponseMode = jsonModeMatch[1].toLowerCase() === "true";
             continue;
         }
-        const requestChangesMatch = trimmed.match(/^request-changes:\s*(true|false)\s*$/i);
+        const requestChangesMatch = setting.match(/^request-changes:\s*(true|false)\s*$/i);
         if (requestChangesMatch) {
             config.requestChanges = requestChangesMatch[1].toLowerCase() === "true";
+            continue;
+        }
+        const reasoningEffortMatch = setting.match(/^reasoning-effort:\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'|(.+))\s*$/i);
+        if (reasoningEffortMatch) {
+            const quotedValue = reasoningEffortMatch[1] ?? reasoningEffortMatch[2];
+            const value = (quotedValue !== undefined
+                ? quotedValue.replace(/\\(.)/g, "$1")
+                : reasoningEffortMatch[3] ?? "").trim();
+            if (value) {
+                config.reasoningEffort = value;
+            }
             continue;
         }
     }
@@ -1760,6 +2009,13 @@ function resolveRequestChanges(actionInput, repoConfig) {
     if (actionInput === "false")
         return false;
     return repoConfig?.requestChanges ?? true;
+}
+/** Reasoning effort is provider configuration: explicit input first, then `.github/robin.yml`, else unset. */
+function resolveReasoningEffort(actionInput, repoConfig) {
+    const trimmed = actionInput.trim();
+    if (trimmed)
+        return trimmed;
+    return repoConfig?.reasoningEffort;
 }
 //# sourceMappingURL=repo-config.js.map
 
